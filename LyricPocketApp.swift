@@ -29,6 +29,7 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published var embeddedLyrics = ""
     @Published var isGenerating = false
     @Published var transcript = ""
+    @Published var firstPassTranscript = ""
     @Published var srtURL: URL?
     @Published var baminiSRTURL: URL?
     @Published var message = "Choose an audio file from Files."
@@ -60,6 +61,7 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             currentTime = 0
             reviewWords = []
             showReview = false
+            firstPassTranscript = ""
             message = "Audio stays on this iPhone."
             suppliedLyrics = ""
             embeddedLyrics = ""
@@ -121,14 +123,10 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         let clipStart = start
         let clipEnd = end
         let chosenLanguage = language
-        let chosenMode = generationMode
+        let chosenMode = lyricLines(from: suppliedLyrics).isEmpty ? "song" : "guided"
+        generationMode = chosenMode
         let referenceLyrics = suppliedLyrics
-
-        if chosenMode == "guided" && lyricLines(from: referenceLyrics).isEmpty {
-            isGenerating = false
-            message = "Paste the correct lyrics or use lyrics found in the audio file first."
-            return
-        }
+        firstPassTranscript = ""
 
         Task {
             do {
@@ -136,8 +134,8 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 defer { try? FileManager.default.removeItem(at: clip) }
                 let focusedAudio: URL?
                 if chosenLanguage == "ta" {
-                    processingStage = "1/2 · Vocal Focus: reducing music and boosting vocals"
-                    message = "Layer 1 of 2: reducing music and strengthening centered vocals…"
+                    processingStage = chosenMode == "guided" ? "1/3 · Vocal Focus: reducing music and boosting vocals" : "1/2 · Vocal Focus: reducing music and boosting vocals"
+                    message = chosenMode == "guided" ? "Step 1 of 3: preparing clearer vocals…" : "Step 1 of 2: preparing clearer vocals…"
                     await Task.yield()
                     focusedAudio = try makeVocalFocusedCopy(from: clip)
                 } else {
@@ -165,8 +163,8 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 var segments: [TranscriptionSegment] = []
                 for (index, candidate) in candidates.enumerated() {
                     processingStage = index == 0
-                        ? "2/2 · AI: listening to the original song"
-                        : "2/2 · AI retry: listening to Vocal Focus audio"
+                        ? (chosenMode == "guided" ? "2/3 · AI: transcribing the song by itself" : "2/2 · AI: transcribing the song")
+                        : (chosenMode == "guided" ? "2/3 · AI retry: transcribing Vocal Focus audio" : "2/2 · AI retry: transcribing Vocal Focus audio")
                     message = index == 0
                         ? "Listening for sung \(chosenLanguage == "ta" ? "Tamil" : chosenLanguage == "en" ? "English" : "Tamil and English") lyrics without the speech-only cutoff…"
                         : "Retrying with music reduction and stronger vocals…"
@@ -178,8 +176,10 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
                         break
                     }
                 }
+                firstPassTranscript = segments.map { cleanText($0.text) }.filter { !$0.isEmpty }.joined(separator: " ")
                 if chosenMode == "guided" {
-                    processingStage = "Matching exact lyrics to detected word times"
+                    processingStage = "3/3 · Comparing detected words with your correct lyrics"
+                    message = "Song transcription complete. Comparing it with your lyrics and correcting the final timestamps…"
                     let words = segments.compactMap { $0.words }.flatMap { $0 }
                     let aligned = try alignLyrics(referenceLyrics, to: words, offset: clipStart)
                     transcript = aligned.map(\.text).joined(separator: "\n")
@@ -187,11 +187,15 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
                     srtURL = try writeAlignedSRT(aligned, bamini: false)
                     baminiSRTURL = try writeAlignedSRT(aligned, bamini: true)
                 } else {
-                    transcript = segments.map { cleanText($0.text) }.filter { !$0.isEmpty }.joined(separator: " ")
+                    transcript = firstPassTranscript
                     reviewWords = makeSongReview(from: segments, offset: clipStart)
                     srtURL = try writeSRT(segments: segments, offset: clipStart)
                 }
-                message = transcript.isEmpty ? "No clear lyrics were detected. Try a section with louder vocals." : "Draft complete. Edit the words if needed, then export the SRT."
+                message = transcript.isEmpty
+                    ? "No clear lyrics were detected. Try a section with louder vocals."
+                    : chosenMode == "guided"
+                        ? "Automatic pipeline complete: song transcription → lyric comparison → corrected timed SRT."
+                        : "Song transcription complete. Add correct lyrics next time for automatic correction and alignment."
                 if !reviewWords.isEmpty {
                     seek(to: clipStart)
                     showReview = true
@@ -518,34 +522,23 @@ struct PlayerView: View {
                         Label("STEP 2 · SELECT THE PART", systemImage: "2.circle.fill").font(.headline).foregroundStyle(accent)
                         AdvancedSelectionView(song: song, accent: accent)
                         Divider().padding(.vertical, 8)
-                        Label("STEP 3 · CHOOSE LYRIC MODE", systemImage: "3.circle.fill").font(.headline).foregroundStyle(accent)
+                        Label("STEP 3 · ADD CORRECT LYRICS", systemImage: "3.circle.fill").font(.headline).foregroundStyle(accent)
                         Picker("Song language", selection: $song.language) {
                             Text("Tamil").tag("ta")
                             Text("English").tag("en")
                             Text("Tamil + English").tag("auto")
                         }.pickerStyle(.segmented)
-                        Picker("Generation mode", selection: $song.generationMode) {
-                            Text("Song only").tag("song")
-                            Text("Song + Lyrics").tag("guided")
-                        }.pickerStyle(.segmented)
-                        Text(song.generationMode == "song"
-                             ? "The app listens to the song and writes the words it detects. Every detected word is highlighted in review."
-                             : "Paste the correct lyrics. The app uses the song to align and highlight those exact words.")
-                            .font(.footnote).foregroundStyle(.secondary)
-                        if song.generationMode == "guided" {
-                            VStack(alignment: .leading, spacing: 10) {
-                                Text("Correct lyrics").font(.headline)
-                                if !song.embeddedLyrics.isEmpty {
-                                    Button("Use lyrics found in this audio file", systemImage: "text.badge.checkmark") {
-                                        song.suppliedLyrics = song.embeddedLyrics
-                                    }.buttonStyle(.bordered)
-                                }
-                                TextEditor(text: $song.suppliedLyrics)
-                                    .frame(minHeight: 180).padding(8)
-                                    .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
-                                Text("Paste the full lyrics or the lines for your selected section. Section labels such as [Chorus] are ignored.")
-                                    .font(.footnote).foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 10) {
+                            if !song.embeddedLyrics.isEmpty {
+                                Button("Use lyrics found in this audio file", systemImage: "text.badge.checkmark") {
+                                    song.suppliedLyrics = song.embeddedLyrics
+                                }.buttonStyle(.bordered)
                             }
+                            TextEditor(text: $song.suppliedLyrics)
+                                .frame(minHeight: 180).padding(8)
+                                .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+                            Text("Optional: paste the full correct lyrics. The app will first transcribe the song alone, then automatically compare and align your lyrics. Leave this empty for song-only transcription.")
+                                .font(.footnote).foregroundStyle(.secondary)
                         }
                         if song.language == "ta" {
                             VStack(alignment: .leading, spacing: 6) {
@@ -578,6 +571,13 @@ struct PlayerView: View {
                                 song.showReview = true
                             }
                             .buttonStyle(.borderedProminent).tint(accent).foregroundStyle(.black)
+                            if !song.firstPassTranscript.isEmpty && song.generationMode == "guided" {
+                                DisclosureGroup("See first song-only transcription") {
+                                    Text(song.firstPassTranscript)
+                                        .font(.footnote).foregroundStyle(.secondary)
+                                        .textSelection(.enabled).padding(.top, 8)
+                                }
+                            }
                             Text("Editable lyric draft").font(.headline)
                             TextEditor(text: $song.transcript)
                                 .frame(minHeight: 150).padding(8)
