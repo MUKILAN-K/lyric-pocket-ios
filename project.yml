@@ -1,0 +1,28 @@
+name: LyricPocket
+options:
+  bundleIdPrefix: com.lyricpocket
+  deploymentTarget:
+    iOS: '17.0'
+targets:
+  LyricPocket:
+    type: application
+    platform: iOS
+    sources: [LyricPocketApp.swift]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.lyricpocket.personal
+        SWIFT_VERSION: '5.0'
+        TARGETED_DEVICE_FAMILY: '1'
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Lyric Pocket
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
+        MARKETING_VERSION: '0.1.0'
+        CURRENT_PROJECT_VERSION: '1'
+schemes:
+  LyricPocket:
+    build:
+      targets:
+        LyricPocket: all
+
