@@ -84,16 +84,16 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             do {
                 let clip = try await exportClip(from: localURL, start: clipStart, end: clipEnd)
                 defer { try? FileManager.default.removeItem(at: clip) }
-                let transcriptionAudio: URL
+                let focusedAudio: URL?
                 if chosenLanguage == "ta" {
                     processingStage = "1/2 · Vocal Focus: reducing music and boosting vocals"
                     message = "Layer 1 of 2: reducing music and strengthening centered vocals…"
                     await Task.yield()
-                    transcriptionAudio = try makeVocalFocusedCopy(from: clip)
+                    focusedAudio = try makeVocalFocusedCopy(from: clip)
                 } else {
-                    transcriptionAudio = clip
+                    focusedAudio = nil
                 }
-                defer { if transcriptionAudio != clip { try? FileManager.default.removeItem(at: transcriptionAudio) } }
+                defer { if let focusedAudio { try? FileManager.default.removeItem(at: focusedAudio) } }
                 message = "Downloading and preparing the AI model. Keep the app open…"
                 let kit = try await WhisperKit(
                     model: "large-v3-v20240930_626MB",
@@ -107,12 +107,27 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
                     task: .transcribe,
                     language: chosenLanguage == "auto" ? nil : chosenLanguage,
                     skipSpecialTokens: true,
-                    wordTimestamps: true
+                    wordTimestamps: true,
+                    firstTokenLogProbThreshold: nil,
+                    noSpeechThreshold: nil
                 )
-                processingStage = "2/2 · AI: listening for lyrics"
-                message = "Layer 2 of 2: listening for \(chosenLanguage == "ta" ? "Tamil" : chosenLanguage == "en" ? "English" : "Tamil and English") lyrics…"
-                let results = try await kit.transcribe(audioPath: transcriptionAudio.path, decodeOptions: options)
-                let segments = results.flatMap(\.segments)
+                let candidates = chosenLanguage == "ta" ? [clip, focusedAudio].compactMap { $0 } : [clip]
+                var segments: [TranscriptionSegment] = []
+                for (index, candidate) in candidates.enumerated() {
+                    processingStage = index == 0
+                        ? "2/2 · AI: listening to the original song"
+                        : "2/2 · AI retry: listening to Vocal Focus audio"
+                    message = index == 0
+                        ? "Listening for sung \(chosenLanguage == "ta" ? "Tamil" : chosenLanguage == "en" ? "English" : "Tamil and English") lyrics without the speech-only cutoff…"
+                        : "Retrying with music reduction and stronger vocals…"
+                    let results = try await kit.transcribe(audioPath: candidate.path, decodeOptions: options)
+                    let candidateSegments = results.flatMap(\.segments)
+                    let candidateText = candidateSegments.map { cleanText($0.text) }.filter { !$0.isEmpty }.joined(separator: " ")
+                    if !candidateText.isEmpty {
+                        segments = candidateSegments
+                        break
+                    }
+                }
                 transcript = segments.map { cleanText($0.text) }.filter { !$0.isEmpty }.joined(separator: " ")
                 srtURL = try writeSRT(segments: segments, offset: clipStart)
                 message = transcript.isEmpty ? "No clear lyrics were detected. Try a section with louder vocals." : "Draft complete. Edit the words if needed, then export the SRT."
