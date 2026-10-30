@@ -82,6 +82,14 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             do {
                 let clip = try await exportClip(from: localURL, start: clipStart, end: clipEnd)
                 defer { try? FileManager.default.removeItem(at: clip) }
+                let transcriptionAudio: URL
+                if chosenLanguage == "ta" {
+                    message = "Layer 1 of 2: reducing music and strengthening centered vocals…"
+                    transcriptionAudio = try makeVocalFocusedCopy(from: clip)
+                } else {
+                    transcriptionAudio = clip
+                }
+                defer { if transcriptionAudio != clip { try? FileManager.default.removeItem(at: transcriptionAudio) } }
                 message = "Downloading and preparing the AI model. Keep the app open…"
                 let kit = try await WhisperKit(
                     model: "large-v3-v20240930_626MB",
@@ -97,7 +105,8 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
                     skipSpecialTokens: true,
                     wordTimestamps: true
                 )
-                let results = try await kit.transcribe(audioPath: clip.path, decodeOptions: options)
+                message = "Layer 2 of 2: listening for \(chosenLanguage == "ta" ? "Tamil" : chosenLanguage == "en" ? "English" : "Tamil and English") lyrics…"
+                let results = try await kit.transcribe(audioPath: transcriptionAudio.path, decodeOptions: options)
                 let segments = results.flatMap(\.segments)
                 transcript = segments.map { cleanText($0.text) }.filter { !$0.isEmpty }.joined(separator: " ")
                 srtURL = try writeSRT(segments: segments, offset: clipStart)
@@ -136,6 +145,51 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         }.joined(separator: "\n\n")
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("LyricPocket-Lyrics.srt")
         try body.write(to: url, atomically: true, encoding: .utf8)
+        return url
+    }
+
+    private func makeVocalFocusedCopy(from source: URL) throws -> URL {
+        let input = try AVAudioFile(forReading: source)
+        let format = input.processingFormat
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(input.length)) else {
+            throw NSError(domain: "LyricPocket", code: 3, userInfo: [NSLocalizedDescriptionKey: "Could not prepare vocal processing."])
+        }
+        try input.read(into: buffer)
+        guard let sourceChannels = buffer.floatChannelData,
+              let monoFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: format.sampleRate, channels: 1, interleaved: false),
+              let mono = AVAudioPCMBuffer(pcmFormat: monoFormat, frameCapacity: buffer.frameLength),
+              let output = mono.floatChannelData?[0] else {
+            throw NSError(domain: "LyricPocket", code: 4, userInfo: [NSLocalizedDescriptionKey: "This audio format cannot be vocal-focused."])
+        }
+        mono.frameLength = buffer.frameLength
+        let count = Int(buffer.frameLength)
+        let channelCount = Int(format.channelCount)
+        let rate = Float(format.sampleRate)
+        let highPassAlpha = (1 / (2 * Float.pi * 110)) / ((1 / (2 * Float.pi * 110)) + (1 / rate))
+        let lowPassAlpha = (1 / rate) / ((1 / (2 * Float.pi * 8_000)) + (1 / rate))
+        var previousInput: Float = 0
+        var previousHigh: Float = 0
+        var previousLow: Float = 0
+        var peak: Float = 0
+        for index in 0..<count {
+            var centered = sourceChannels[0][index]
+            if channelCount > 1 { centered = (centered + sourceChannels[1][index]) * 0.5 }
+            let high = highPassAlpha * (previousHigh + centered - previousInput)
+            let low = previousLow + lowPassAlpha * (high - previousLow)
+            let compressed = tanhf(low * 2.4)
+            output[index] = compressed
+            peak = max(peak, abs(compressed))
+            previousInput = centered
+            previousHigh = high
+            previousLow = low
+        }
+        if peak > 0.0001 {
+            let gain = min(8, 0.95 / peak)
+            for index in 0..<count { output[index] *= gain }
+        }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("lyric-pocket-vocals-\(UUID().uuidString).wav")
+        let file = try AVAudioFile(forWriting: url, settings: monoFormat.settings, commonFormat: .pcmFormatFloat32, interleaved: false)
+        try file.write(from: mono)
         return url
     }
 
