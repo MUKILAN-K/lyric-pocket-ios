@@ -21,6 +21,7 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published var transcript = ""
     @Published var srtURL: URL?
     @Published var message = "Choose an audio file from Files."
+    @Published var processingStage = ""
     private var player: AVAudioPlayer?
     private var timer: Timer?
     private var localURL: URL?
@@ -73,6 +74,7 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         isGenerating = true
         transcript = ""
         srtURL = nil
+        processingStage = "Preparing audio"
         message = "Preparing the selected section…"
         let clipStart = start
         let clipEnd = end
@@ -84,7 +86,9 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 defer { try? FileManager.default.removeItem(at: clip) }
                 let transcriptionAudio: URL
                 if chosenLanguage == "ta" {
+                    processingStage = "1/2 · Vocal Focus: reducing music and boosting vocals"
                     message = "Layer 1 of 2: reducing music and strengthening centered vocals…"
+                    await Task.yield()
                     transcriptionAudio = try makeVocalFocusedCopy(from: clip)
                 } else {
                     transcriptionAudio = clip
@@ -105,6 +109,7 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
                     skipSpecialTokens: true,
                     wordTimestamps: true
                 )
+                processingStage = "2/2 · AI: listening for lyrics"
                 message = "Layer 2 of 2: listening for \(chosenLanguage == "ta" ? "Tamil" : chosenLanguage == "en" ? "English" : "Tamil and English") lyrics…"
                 let results = try await kit.transcribe(audioPath: transcriptionAudio.path, decodeOptions: options)
                 let segments = results.flatMap(\.segments)
@@ -115,6 +120,7 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 message = "Lyrics generation failed: \(error.localizedDescription)"
             }
             isGenerating = false
+            processingStage = ""
         }
     }
 
@@ -247,6 +253,17 @@ struct PlayerView: View {
                             Text("English").tag("en")
                             Text("Tamil + English").tag("auto")
                         }.pickerStyle(.segmented)
+                        if song.language == "ta" {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Label("Vocal Focus active", systemImage: "waveform.badge.magnifyingglass")
+                                    .font(.headline).foregroundStyle(accent)
+                                Text("Music reduction → vocal boost → Tamil lyrics AI")
+                                    .font(.footnote).foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(14)
+                            .background(accent.opacity(0.09), in: RoundedRectangle(cornerRadius: 12))
+                        }
                         Text("The first run downloads about 626 MB over Wi-Fi. The model and your audio stay on this iPhone.")
                             .font(.footnote).foregroundStyle(.secondary)
                         Button(song.isGenerating ? "Working…" : "Generate lyrics on iPhone", systemImage: "waveform.and.magnifyingglass") {
@@ -254,7 +271,12 @@ struct PlayerView: View {
                         }
                         .buttonStyle(.borderedProminent).tint(accent).foregroundStyle(.black)
                         .disabled(song.isGenerating || song.end <= song.start)
-                        if song.isGenerating { ProgressView().tint(accent) }
+                        if song.isGenerating {
+                            VStack(alignment: .leading, spacing: 8) {
+                                ProgressView().tint(accent)
+                                Text(song.processingStage).font(.footnote).foregroundStyle(accent)
+                            }
+                        }
                         if !song.transcript.isEmpty {
                             Text("Editable lyric draft").font(.headline)
                             TextEditor(text: $song.transcript)
