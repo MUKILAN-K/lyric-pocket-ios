@@ -1,0 +1,31 @@
+name: Build iPhone app
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install project generator
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        run: xcodegen generate
+      - name: Build unsigned native app
+        run: |
+          xcodebuild -project LyricPocket.xcodeproj -scheme LyricPocket -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+      - name: Package for local signing
+        run: |
+          mkdir -p package/Payload
+          cp -R build/Build/Products/Release-iphoneos/LyricPocket.app package/Payload/
+          cd package
+          zip -qry ../LyricPocket-unsigned.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LyricPocket-unsigned
+          path: LyricPocket-unsigned.ipa
+          retention-days: 3
