@@ -466,16 +466,18 @@ struct PlayerView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
-                    Text("NATIVE IPHONE TEST · 01").font(.caption).foregroundStyle(accent)
-                    Text("Every lyric starts\nwith a listen.").font(.system(size: 38, weight: .regular, design: .serif))
-                    Text("Import your song and preview a short section.").foregroundStyle(.secondary)
-                    Button { importing = true } label: { Label("Pick a song from Files", systemImage: "music.note") }
+                    Text("LYRIC POCKET").font(.caption.bold()).foregroundStyle(accent)
+                    Text("Create timed lyrics\non your iPhone.").font(.system(size: 36, weight: .regular, design: .serif))
+                    Text("Choose a song, select the part you need, then review every highlighted word.").foregroundStyle(.secondary)
+                    Label("STEP 1 · CHOOSE A SONG", systemImage: "1.circle.fill").font(.headline).foregroundStyle(accent)
+                    Button { importing = true } label: { Label(song.duration > 0 ? "Choose a different song" : "Choose song from Files", systemImage: "music.note") }
                         .buttonStyle(.borderedProminent).tint(accent).foregroundStyle(.black)
                     Text(song.name).font(.headline)
                     if song.duration > 0 {
+                        Label("STEP 2 · SELECT THE PART", systemImage: "2.circle.fill").font(.headline).foregroundStyle(accent)
                         AdvancedSelectionView(song: song, accent: accent)
                         Divider().padding(.vertical, 8)
-                        Text("Generate lyrics").font(.title2.bold())
+                        Label("STEP 3 · CHOOSE LYRIC MODE", systemImage: "3.circle.fill").font(.headline).foregroundStyle(accent)
                         Picker("Song language", selection: $song.language) {
                             Text("Tamil").tag("ta")
                             Text("English").tag("en")
@@ -485,6 +487,10 @@ struct PlayerView: View {
                             Text("Song only").tag("song")
                             Text("Song + Lyrics").tag("guided")
                         }.pickerStyle(.segmented)
+                        Text(song.generationMode == "song"
+                             ? "The app listens to the song and writes the words it detects. Every detected word is highlighted in review."
+                             : "Paste the correct lyrics. The app uses the song to align and highlight those exact words.")
+                            .font(.footnote).foregroundStyle(.secondary)
                         if song.generationMode == "guided" {
                             VStack(alignment: .leading, spacing: 10) {
                                 Text("Correct lyrics").font(.headline)
@@ -513,7 +519,8 @@ struct PlayerView: View {
                         }
                         Text("The first run downloads about 626 MB over Wi-Fi. The model and your audio stay on this iPhone.")
                             .font(.footnote).foregroundStyle(.secondary)
-                        Button(song.isGenerating ? "Working…" : "Generate lyrics on iPhone", systemImage: "waveform.and.magnifyingglass") {
+                        Label("STEP 4 · GENERATE AND REVIEW", systemImage: "4.circle.fill").font(.headline).foregroundStyle(accent)
+                        Button(song.isGenerating ? "Creating timed lyrics…" : "Generate timed lyrics", systemImage: "waveform.and.magnifyingglass") {
                             song.generateLyrics()
                         }
                         .buttonStyle(.borderedProminent).tint(accent).foregroundStyle(.black)
@@ -525,7 +532,7 @@ struct PlayerView: View {
                             }
                         }
                         if !song.transcript.isEmpty {
-                            Button("Open timing review", systemImage: "text.word.spacing") {
+                            Button("Play and check highlighted words", systemImage: "play.rectangle.fill") {
                                 song.seek(to: song.start)
                                 song.showReview = true
                             }
@@ -548,7 +555,10 @@ struct PlayerView: View {
                                 .font(.footnote).foregroundStyle(.secondary)
                         }
                     }
-                    Text(song.message).font(.footnote).accessibilityIdentifier("status")
+                    Label(song.message, systemImage: song.isGenerating ? "hourglass" : "info.circle")
+                        .font(.footnote).padding(12).frame(maxWidth: .infinity, alignment: .leading)
+                        .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
+                        .accessibilityIdentifier("status")
                     Divider()
                     Text("Lyrics are generated on this iPhone. Singing is harder than speech, so the result remains an editable draft.")
                         .font(.footnote).foregroundStyle(.secondary)
@@ -572,6 +582,7 @@ struct PlayerView: View {
 struct AdvancedSelectionView: View {
     @ObservedObject var song: SongPlayer
     let accent: Color
+    @State private var showFineControls = false
 
     private func clock(_ value: Double) -> String {
         String(format: "%02d:%05.2f", Int(value) / 60, value.truncatingRemainder(dividingBy: 60))
@@ -601,24 +612,13 @@ struct AdvancedSelectionView: View {
             VStack(alignment: .leading, spacing: 6) {
                 HStack { Text("IN").font(.caption.bold()).foregroundStyle(accent); Spacer(); Text(clock(song.start)).monospacedDigit() }
                 Slider(value: Binding(get: { song.start }, set: { song.setStart($0) }), in: 0...max(0.1, song.duration - 0.1), step: 0.05)
-                HStack {
-                    Button("−0.1") { song.setStart(song.start - 0.1) }
-                    Button("+0.1") { song.setStart(song.start + 0.1) }
-                    Spacer()
-                    Button("Set IN here") { song.setStart(song.currentTime) }
-                }.buttonStyle(.bordered).font(.caption)
             }
             VStack(alignment: .leading, spacing: 6) {
                 HStack { Text("OUT").font(.caption.bold()).foregroundStyle(accent); Spacer(); Text(clock(song.end)).monospacedDigit() }
                 Slider(value: Binding(get: { song.end }, set: { song.setEnd($0) }), in: 0...max(0.1, song.duration), step: 0.05)
-                HStack {
-                    Button("−0.1") { song.setEnd(song.end - 0.1) }
-                    Button("+0.1") { song.setEnd(song.end + 0.1) }
-                    Spacer()
-                    Button("Set OUT here") { song.setEnd(song.currentTime) }
-                }.buttonStyle(.bordered).font(.caption)
             }
             HStack {
+                Text("Quick length:").font(.caption).foregroundStyle(.secondary)
                 ForEach([15.0, 30.0, 60.0], id: \.self) { length in
                     Button("\(Int(length))s") { song.setEnd(min(song.duration, song.start + length)) }
                 }
@@ -629,6 +629,22 @@ struct AdvancedSelectionView: View {
                 Button("Pause", systemImage: "pause.fill") { song.stop() }.disabled(!song.playing)
                 Button("Restart", systemImage: "backward.end.fill") { song.stop(); song.seek(to: song.start) }
             }.buttonStyle(.bordered)
+            DisclosureGroup("Fine timing controls", isExpanded: $showFineControls) {
+                VStack(spacing: 10) {
+                    HStack {
+                        Text("Start").frame(width: 45, alignment: .leading)
+                        Button("−0.1") { song.setStart(song.start - 0.1) }
+                        Button("+0.1") { song.setStart(song.start + 0.1) }
+                        Button("Use playhead") { song.setStart(song.currentTime) }
+                    }
+                    HStack {
+                        Text("End").frame(width: 45, alignment: .leading)
+                        Button("−0.1") { song.setEnd(song.end - 0.1) }
+                        Button("+0.1") { song.setEnd(song.end + 0.1) }
+                        Button("Use playhead") { song.setEnd(song.currentTime) }
+                    }
+                }.buttonStyle(.bordered).font(.caption).padding(.top, 8)
+            }
         }
         .padding(16)
         .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 16))
@@ -643,6 +659,11 @@ struct TimingReviewView: View {
         song.reviewWords.firstIndex { song.currentTime >= $0.start && song.currentTime < $0.end }
     }
 
+    private var activeWord: ReviewWord? {
+        guard let activeIndex else { return nil }
+        return song.reviewWords[activeIndex]
+    }
+
     private func clock(_ value: Double) -> String {
         String(format: "%02d:%05.2f", Int(value) / 60, value.truncatingRemainder(dividingBy: 60))
     }
@@ -651,7 +672,10 @@ struct TimingReviewView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
-                    Text(song.generationMode == "guided" ? "Aligned word timing review" : "Detected word timing review")
+                    Label(song.generationMode == "guided" ? "Correct lyrics · aligned highlights" : "Song-only · detected highlights",
+                          systemImage: "checkmark.circle.fill")
+                        .font(.subheadline.bold()).foregroundStyle(accent)
+                    Text("Play and check every word")
                         .font(.title2.bold())
                     Text(song.generationMode == "guided"
                          ? "The exact supplied lyrics are fitted inside the detected line times. Tap any word to check that point."
@@ -663,6 +687,19 @@ struct TimingReviewView: View {
                         Text("\(clock(song.start)) – \(clock(song.end))").font(.caption).foregroundStyle(.secondary)
                     }
                     Slider(value: Binding(get: { song.currentTime }, set: { song.seek(to: $0) }), in: song.start...max(song.start + 0.1, song.end), step: 0.02)
+                    VStack(spacing: 6) {
+                        Text("NOW PLAYING").font(.caption.bold()).foregroundStyle(.secondary)
+                        Text(activeWord?.text ?? "Press Play")
+                            .font(.system(size: 34, weight: .bold, design: .rounded))
+                            .foregroundStyle(activeWord == nil ? Color.secondary : accent)
+                            .lineLimit(2).minimumScaleFactor(0.6)
+                        if let activeWord {
+                            Text("\(clock(activeWord.start)) → \(clock(activeWord.end))")
+                                .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                        }
+                    }
+                    .frame(maxWidth: .infinity).padding(20)
+                    .background(accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 16))
                     HStack {
                         Button(song.playing ? "Playing…" : "Play", systemImage: "play.fill") { song.play() }.disabled(song.playing)
                         Button("Pause", systemImage: "pause.fill") { song.stop() }.disabled(!song.playing)
