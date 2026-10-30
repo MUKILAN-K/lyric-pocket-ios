@@ -9,6 +9,13 @@ struct LyricPocketApp: App {
     var body: some Scene { WindowGroup { PlayerView() } }
 }
 
+struct ReviewWord: Identifiable, Hashable {
+    let id = UUID()
+    let text: String
+    let start: Double
+    let end: Double
+}
+
 @MainActor
 final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published var name = "No song selected"
@@ -26,6 +33,9 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published var baminiSRTURL: URL?
     @Published var message = "Choose an audio file from Files."
     @Published var processingStage = ""
+    @Published var currentTime: Double = 0
+    @Published var reviewWords: [ReviewWord] = []
+    @Published var showReview = false
     private var player: AVAudioPlayer?
     private var timer: Timer?
     private var localURL: URL?
@@ -47,6 +57,9 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             duration = next.duration
             start = 0
             end = min(15, duration)
+            currentTime = 0
+            reviewWords = []
+            showReview = false
             message = "Audio stays on this iPhone."
             suppliedLyrics = ""
             embeddedLyrics = ""
@@ -64,16 +77,35 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
             try AVAudioSession.sharedInstance().setActive(true)
             player.currentTime = start
+            currentTime = start
             guard player.play() else { message = "Playback could not start."; return }
             playing = true
             timer = Timer.scheduledTimer(withTimeInterval: 0.03, repeats: true) { [weak self] _ in
                 guard let self else { return }
+                self.currentTime = player.currentTime
                 if player.currentTime >= self.end || !player.isPlaying { self.stop() }
             }
         } catch { message = "Playback failed: \(error.localizedDescription)" }
     }
 
     func stop() { player?.pause(); timer?.invalidate(); timer = nil; playing = false }
+
+    func seek(to time: Double) {
+        let value = min(duration, max(0, time))
+        player?.currentTime = value
+        currentTime = value
+    }
+
+    func setStart(_ value: Double) {
+        stop()
+        start = min(max(0, value), max(0, end - 0.1))
+        seek(to: start)
+    }
+
+    func setEnd(_ value: Double) {
+        stop()
+        end = max(min(duration, value), min(duration, start + 0.1))
+    }
 
     func generateLyrics() {
         guard let localURL, end > start else { return }
@@ -82,6 +114,8 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         transcript = ""
         srtURL = nil
         baminiSRTURL = nil
+        reviewWords = []
+        showReview = false
         processingStage = "Preparing audio"
         message = "Preparing the selected section…"
         let clipStart = start
@@ -149,13 +183,19 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
                     let words = segments.compactMap { $0.words }.flatMap { $0 }
                     let aligned = try alignLyrics(referenceLyrics, to: words, offset: clipStart)
                     transcript = aligned.map(\.text).joined(separator: "\n")
+                    reviewWords = makeGuidedReview(from: aligned)
                     srtURL = try writeAlignedSRT(aligned, bamini: false)
                     baminiSRTURL = try writeAlignedSRT(aligned, bamini: true)
                 } else {
                     transcript = segments.map { cleanText($0.text) }.filter { !$0.isEmpty }.joined(separator: " ")
+                    reviewWords = makeSongReview(from: segments, offset: clipStart)
                     srtURL = try writeSRT(segments: segments, offset: clipStart)
                 }
                 message = transcript.isEmpty ? "No clear lyrics were detected. Try a section with louder vocals." : "Draft complete. Edit the words if needed, then export the SRT."
+                if !reviewWords.isEmpty {
+                    seek(to: clipStart)
+                    showReview = true
+                }
             } catch {
                 message = "Lyrics generation failed: \(error.localizedDescription)"
             }
@@ -346,6 +386,36 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         return url
     }
 
+    private func makeSongReview(from segments: [TranscriptionSegment], offset: Double) -> [ReviewWord] {
+        segments.flatMap { segment -> [ReviewWord] in
+            if let words = segment.words, !words.isEmpty {
+                return words.compactMap { timing in
+                    let text = cleanText(timing.word)
+                    return text.isEmpty ? nil : ReviewWord(text: text, start: Double(timing.start) + offset, end: Double(timing.end) + offset)
+                }
+            }
+            let words = cleanText(segment.text).split(whereSeparator: { $0.isWhitespace }).map(String.init)
+            guard !words.isEmpty else { return [] }
+            let beginning = Double(segment.start) + offset
+            let finish = Double(segment.end) + offset
+            let step = max(0.05, (finish - beginning) / Double(words.count))
+            return words.enumerated().map { index, word in
+                ReviewWord(text: word, start: beginning + Double(index) * step, end: min(finish, beginning + Double(index + 1) * step))
+            }
+        }
+    }
+
+    private func makeGuidedReview(from lines: [AlignedLyric]) -> [ReviewWord] {
+        lines.flatMap { line -> [ReviewWord] in
+            let words = line.text.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+            guard !words.isEmpty else { return [] }
+            let step = max(0.05, (line.end - line.start) / Double(words.count))
+            return words.enumerated().map { index, word in
+                ReviewWord(text: word, start: line.start + Double(index) * step, end: min(line.end, line.start + Double(index + 1) * step))
+            }
+        }
+    }
+
     private func unicodeToBamini(_ input: String) -> String {
         var text = input.replacingOccurrences(of: "ஸ்ரீ", with: "=").replacingOccurrences(of: ",", with: ">")
         let bases: [(String, String, String, String)] = [
@@ -403,23 +473,7 @@ struct PlayerView: View {
                         .buttonStyle(.borderedProminent).tint(accent).foregroundStyle(.black)
                     Text(song.name).font(.headline)
                     if song.duration > 0 {
-                        Text("Song length: \(song.duration, specifier: "%.1f") seconds")
-                        Text("Start: \(song.start, specifier: "%.1f") seconds")
-                        Slider(value: $song.start, in: 0...max(0.1, song.duration - 0.1), step: 0.1)
-                            .onChange(of: song.start) { _, value in
-                                song.stop()
-                                song.end = min(song.duration, max(song.end, value + 0.1))
-                            }
-                        Text("End: \(song.end, specifier: "%.1f") seconds")
-                        Slider(value: $song.end, in: 0...song.duration, step: 0.1)
-                            .onChange(of: song.end) { _, _ in song.stop() }
-                        Button("Use 15 seconds from start") { song.stop(); song.end = min(song.duration, song.start + 15) }
-                        if song.end <= song.start { Text("Move the end after the start.").foregroundStyle(.orange) }
-                        HStack {
-                            Button("Play section", systemImage: "play.fill") { song.play() }
-                                .disabled(song.end <= song.start || song.playing)
-                            Button("Pause", systemImage: "pause.fill") { song.stop() }.disabled(!song.playing)
-                        }.buttonStyle(.bordered)
+                        AdvancedSelectionView(song: song, accent: accent)
                         Divider().padding(.vertical, 8)
                         Text("Generate lyrics").font(.title2.bold())
                         Picker("Song language", selection: $song.language) {
@@ -471,6 +525,11 @@ struct PlayerView: View {
                             }
                         }
                         if !song.transcript.isEmpty {
+                            Button("Open timing review", systemImage: "text.word.spacing") {
+                                song.seek(to: song.start)
+                                song.showReview = true
+                            }
+                            .buttonStyle(.borderedProminent).tint(accent).foregroundStyle(.black)
                             Text("Editable lyric draft").font(.headline)
                             TextEditor(text: $song.transcript)
                                 .frame(minHeight: 150).padding(8)
@@ -504,5 +563,162 @@ struct PlayerView: View {
                 }
             }
             .onChange(of: scenePhase) { _, phase in if phase != .active { song.stop() } }
+            .navigationDestination(isPresented: $song.showReview) {
+                TimingReviewView(song: song, accent: accent)
+            }
+    }
+}
+
+struct AdvancedSelectionView: View {
+    @ObservedObject var song: SongPlayer
+    let accent: Color
+
+    private func clock(_ value: Double) -> String {
+        String(format: "%02d:%05.2f", Int(value) / 60, value.truncatingRemainder(dividingBy: 60))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text("Select song section").font(.title3.bold())
+                Spacer()
+                Text("\(clock(song.end - song.start)) selected").font(.caption).foregroundStyle(accent)
+            }
+            GeometryReader { geometry in
+                let width = max(1, geometry.size.width)
+                let left = width * song.start / max(song.duration, 0.1)
+                let right = width * song.end / max(song.duration, 0.1)
+                ZStack(alignment: .leading) {
+                    Capsule().fill(.white.opacity(0.12)).frame(height: 14)
+                    Rectangle().fill(accent.opacity(0.8)).frame(width: max(2, right - left), height: 14).offset(x: left)
+                    Rectangle().fill(.white).frame(width: 2, height: 22).offset(x: width * song.currentTime / max(song.duration, 0.1))
+                }
+            }.frame(height: 22)
+            HStack {
+                Text("00:00"); Spacer(); Text(clock(song.duration))
+            }.font(.caption2).foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack { Text("IN").font(.caption.bold()).foregroundStyle(accent); Spacer(); Text(clock(song.start)).monospacedDigit() }
+                Slider(value: Binding(get: { song.start }, set: { song.setStart($0) }), in: 0...max(0.1, song.duration - 0.1), step: 0.05)
+                HStack {
+                    Button("−0.1") { song.setStart(song.start - 0.1) }
+                    Button("+0.1") { song.setStart(song.start + 0.1) }
+                    Spacer()
+                    Button("Set IN here") { song.setStart(song.currentTime) }
+                }.buttonStyle(.bordered).font(.caption)
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                HStack { Text("OUT").font(.caption.bold()).foregroundStyle(accent); Spacer(); Text(clock(song.end)).monospacedDigit() }
+                Slider(value: Binding(get: { song.end }, set: { song.setEnd($0) }), in: 0...max(0.1, song.duration), step: 0.05)
+                HStack {
+                    Button("−0.1") { song.setEnd(song.end - 0.1) }
+                    Button("+0.1") { song.setEnd(song.end + 0.1) }
+                    Spacer()
+                    Button("Set OUT here") { song.setEnd(song.currentTime) }
+                }.buttonStyle(.bordered).font(.caption)
+            }
+            HStack {
+                ForEach([15.0, 30.0, 60.0], id: \.self) { length in
+                    Button("\(Int(length))s") { song.setEnd(min(song.duration, song.start + length)) }
+                }
+            }.buttonStyle(.bordered)
+            HStack {
+                Button(song.playing ? "Playing…" : "Play selection", systemImage: "play.fill") { song.play() }
+                    .disabled(song.playing)
+                Button("Pause", systemImage: "pause.fill") { song.stop() }.disabled(!song.playing)
+                Button("Restart", systemImage: "backward.end.fill") { song.stop(); song.seek(to: song.start) }
+            }.buttonStyle(.bordered)
+        }
+        .padding(16)
+        .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 16))
+    }
+}
+
+struct TimingReviewView: View {
+    @ObservedObject var song: SongPlayer
+    let accent: Color
+
+    private var activeIndex: Int? {
+        song.reviewWords.firstIndex { song.currentTime >= $0.start && song.currentTime < $0.end }
+    }
+
+    private func clock(_ value: Double) -> String {
+        String(format: "%02d:%05.2f", Int(value) / 60, value.truncatingRemainder(dividingBy: 60))
+    }
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    Text(song.generationMode == "guided" ? "Aligned word timing review" : "Detected word timing review")
+                        .font(.title2.bold())
+                    Text(song.generationMode == "guided"
+                         ? "The exact supplied lyrics are fitted inside the detected line times. Tap any word to check that point."
+                         : "Each highlight follows the timestamp detected by the on-device model. Tap any word to seek to it.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    HStack {
+                        Text(clock(song.currentTime)).font(.title3.monospacedDigit())
+                        Spacer()
+                        Text("\(clock(song.start)) – \(clock(song.end))").font(.caption).foregroundStyle(.secondary)
+                    }
+                    Slider(value: Binding(get: { song.currentTime }, set: { song.seek(to: $0) }), in: song.start...max(song.start + 0.1, song.end), step: 0.02)
+                    HStack {
+                        Button(song.playing ? "Playing…" : "Play", systemImage: "play.fill") { song.play() }.disabled(song.playing)
+                        Button("Pause", systemImage: "pause.fill") { song.stop() }.disabled(!song.playing)
+                        Button("Restart", systemImage: "backward.end.fill") { song.stop(); song.seek(to: song.start) }
+                    }.buttonStyle(.bordered)
+                    FlowLayout(spacing: 8) {
+                        ForEach(Array(song.reviewWords.enumerated()), id: \.element.id) { index, word in
+                            Button {
+                                song.stop()
+                                song.seek(to: word.start)
+                            } label: {
+                                VStack(spacing: 3) {
+                                    Text(word.text).font(.title3.weight(index == activeIndex ? .bold : .regular))
+                                    Text(clock(word.start)).font(.system(size: 9, design: .monospaced))
+                                }
+                                .padding(.horizontal, 9).padding(.vertical, 7)
+                                .foregroundStyle(index == activeIndex ? Color.black : Color.white)
+                                .background(index == activeIndex ? accent : .white.opacity(0.08), in: RoundedRectangle(cornerRadius: 9))
+                            }
+                            .buttonStyle(.plain).id(index)
+                        }
+                    }
+                }.padding(24)
+            }
+            .onChange(of: activeIndex) { _, index in
+                if let index { withAnimation { proxy.scrollTo(index, anchor: .center) } }
+            }
+        }
+        .navigationTitle("Timing Review")
+        .navigationBarTitleDisplayMode(.inline)
+        .background(Color(red: 0.07, green: 0.11, blue: 0.10))
+        .onDisappear { song.stop() }
+    }
+}
+
+struct FlowLayout: Layout {
+    var spacing: CGFloat = 8
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let width = proposal.width ?? 300
+        var x: CGFloat = 0, y: CGFloat = 0, rowHeight: CGFloat = 0
+        for view in subviews {
+            let size = view.sizeThatFits(.unspecified)
+            if x > 0 && x + size.width > width { x = 0; y += rowHeight + spacing; rowHeight = 0 }
+            x += size.width + spacing; rowHeight = max(rowHeight, size.height)
+        }
+        return CGSize(width: width, height: y + rowHeight)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var x = bounds.minX, y = bounds.minY, rowHeight: CGFloat = 0
+        for view in subviews {
+            let size = view.sizeThatFits(.unspecified)
+            if x > bounds.minX && x + size.width > bounds.maxX { x = bounds.minX; y += rowHeight + spacing; rowHeight = 0 }
+            view.place(at: CGPoint(x: x, y: y), anchor: .topLeading, proposal: ProposedViewSize(size))
+            x += size.width + spacing; rowHeight = max(rowHeight, size.height)
+        }
     }
 }
