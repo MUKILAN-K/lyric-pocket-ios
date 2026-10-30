@@ -2,6 +2,7 @@ import SwiftUI
 import AVFoundation
 import UniformTypeIdentifiers
 import WhisperKit
+import UIKit
 
 @main
 struct LyricPocketApp: App {
@@ -93,11 +94,12 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 let options = DecodingOptions(
                     task: .transcribe,
                     language: chosenLanguage == "auto" ? nil : chosenLanguage,
+                    skipSpecialTokens: true,
                     wordTimestamps: true
                 )
                 let results = try await kit.transcribe(audioPath: clip.path, decodeOptions: options)
                 let segments = results.flatMap(\.segments)
-                transcript = segments.map(\.text).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+                transcript = segments.map { cleanText($0.text) }.filter { !$0.isEmpty }.joined(separator: " ")
                 srtURL = try writeSRT(segments: segments, offset: clipStart)
                 message = transcript.isEmpty ? "No clear lyrics were detected. Try a section with louder vocals." : "Draft complete. Edit the words if needed, then export the SRT."
             } catch {
@@ -125,19 +127,27 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     private func writeSRT(segments: [TranscriptionSegment], offset: Double) throws -> URL {
-        let body = segments.enumerated().map { index, segment in
-            "\(index + 1)\n\(srtTime(Double(segment.start) + offset)) --> \(srtTime(Double(segment.end) + offset))\n\(segment.text.trimmingCharacters(in: .whitespacesAndNewlines))"
+        let usable = segments.compactMap { segment -> (TranscriptionSegment, String)? in
+            let text = cleanText(segment.text)
+            return text.isEmpty ? nil : (segment, text)
+        }
+        let body = usable.enumerated().map { index, entry in
+            "\(index + 1)\n\(srtTime(Double(entry.0.start) + offset)) --> \(srtTime(Double(entry.0.end) + offset))\n\(entry.1)"
         }.joined(separator: "\n\n")
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("LyricPocket-Lyrics.srt")
         try body.write(to: url, atomically: true, encoding: .utf8)
         return url
     }
 
+    private func cleanText(_ text: String) -> String {
+        text.replacingOccurrences(of: #"<\|[^>]+\|>"#, with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private func srtTime(_ seconds: Double) -> String {
         let ms = max(0, Int((seconds * 1000).rounded()))
         return String(format: "%02d:%02d:%02d,%03d", ms / 3_600_000, (ms / 60_000) % 60, (ms / 1000) % 60, ms % 1000)
     }
-
     func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) { stop() }
     deinit { timer?.invalidate(); if let localURL { try? FileManager.default.removeItem(at: localURL) } }
 }
@@ -152,9 +162,9 @@ struct PlayerView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
-                    Text("ON-DEVICE LYRICS · 02").font(.caption).foregroundStyle(accent)
+                    Text("NATIVE IPHONE TEST · 01").font(.caption).foregroundStyle(accent)
                     Text("Every lyric starts\nwith a listen.").font(.system(size: 38, weight: .regular, design: .serif))
-                    Text("Import your song, select a section, and generate a timed lyric draft.").foregroundStyle(.secondary)
+                    Text("Import your song and preview a short section.").foregroundStyle(.secondary)
                     Button { importing = true } label: { Label("Pick a song from Files", systemImage: "music.note") }
                         .buttonStyle(.borderedProminent).tint(accent).foregroundStyle(.black)
                     Text(song.name).font(.headline)
