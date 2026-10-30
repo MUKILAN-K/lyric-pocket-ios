@@ -300,6 +300,7 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         let text: String
         let start: Double
         let end: Double
+        let words: [ReviewWord]
     }
 
     private func lyricLines(from text: String) -> [String] {
@@ -333,44 +334,91 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     private func alignLyrics(_ lyrics: String, to timings: [WordTiming], offset: Double) throws -> [AlignedLyric] {
         let lines = lyricLines(from: lyrics)
-        let recognized = timings.map { normalizedWords($0.word).joined() }
-        guard !lines.isEmpty, !timings.isEmpty, recognized.contains(where: { !$0.isEmpty }) else {
+        let lineWords = lines.map { $0.split(whereSeparator: { $0.isWhitespace }).map(String.init) }
+        let referenceWords = lineWords.flatMap { $0 }
+        let reference = referenceWords.map { normalizedWords($0).joined() }
+        let usableTimings = timings.filter { !normalizedWords($0.word).joined().isEmpty }
+        let recognized = usableTimings.map { normalizedWords($0.word).joined() }
+        guard !lines.isEmpty, !reference.isEmpty, !usableTimings.isEmpty else {
             throw NSError(domain: "LyricPocket", code: 5, userInfo: [NSLocalizedDescriptionKey: "Word timing anchors were not detected. Try a longer section with clear vocals."])
         }
 
-        var bestLine = 0
-        var bestScore = -1.0
-        for (index, line) in lines.enumerated() {
-            let candidates = normalizedWords(line)
-            guard !candidates.isEmpty else { continue }
-            let count = min(candidates.count, recognized.count)
-            let score = (0..<count).map { wordScore(candidates[$0], recognized[$0]) }.reduce(0, +) / Double(count)
-            if score > bestScore { bestScore = score; bestLine = index }
+        // Semi-global sequence alignment: the clip may begin anywhere in the full lyrics.
+        let n = reference.count, m = recognized.count
+        let skipReference = 0.52, skipDetected = 0.62
+        var cost = Array(repeating: Array(repeating: Double.infinity, count: m + 1), count: n + 1)
+        var move = Array(repeating: Array(repeating: UInt8(0), count: m + 1), count: n + 1)
+        for i in 0...n { cost[i][0] = 0 } // Free lyric prefix: find where this clip starts.
+        if m > 0 { for j in 1...m { cost[0][j] = Double(j) * skipDetected; move[0][j] = 2 } }
+        if n > 0 && m > 0 {
+            for i in 1...n {
+                for j in 1...m {
+                    let similarity = wordScore(reference[i - 1], recognized[j - 1])
+                    let diagonal = cost[i - 1][j - 1] + (1 - similarity)
+                    let omitReference = cost[i - 1][j] + skipReference
+                    let omitDetected = cost[i][j - 1] + skipDetected
+                    if diagonal <= omitReference && diagonal <= omitDetected { cost[i][j] = diagonal; move[i][j] = 1 }
+                    else if omitReference <= omitDetected { cost[i][j] = omitReference; move[i][j] = 3 }
+                    else { cost[i][j] = omitDetected; move[i][j] = 2 }
+                }
+            }
+        }
+        var endReference = 1
+        for i in 1...n where cost[i][m] < cost[endReference][m] { endReference = i }
+        var i = endReference, j = m
+        var anchors: [Int: Int] = [:]
+        while i > 0 && j > 0 {
+            if move[i][j] == 1 {
+                if wordScore(reference[i - 1], recognized[j - 1]) >= 0.28 { anchors[i - 1] = j - 1 }
+                i -= 1; j -= 1
+            } else if move[i][j] == 3 { i -= 1 }
+            else { j -= 1 }
+        }
+        let startReference = anchors.keys.min() ?? max(0, endReference - m)
+        let finishReference = anchors.keys.max() ?? min(n - 1, startReference + m - 1)
+        let selectedRange = startReference...finishReference
+        let sortedAnchors = anchors.filter { selectedRange.contains($0.key) }.sorted { $0.key < $1.key }
+        guard !sortedAnchors.isEmpty else {
+            throw NSError(domain: "LyricPocket", code: 6, userInfo: [NSLocalizedDescriptionKey: "The detected words could not be matched to the supplied lyrics. Try a section with clearer vocals."])
         }
 
-        let available = Array(lines[bestLine...])
-        var selected: [String] = []
-        var lyricWordCount = 0
-        for line in available {
-            selected.append(line)
-            lyricWordCount += max(1, normalizedWords(line).count)
-            if lyricWordCount >= recognized.count { break }
+        var alignedWords: [Int: ReviewWord] = [:]
+        for refIndex in selectedRange {
+            let previous = sortedAnchors.last { $0.key <= refIndex }
+            let next = sortedAnchors.first { $0.key >= refIndex }
+            let startTime: Double
+            let endTime: Double
+            if let exact = anchors[refIndex] {
+                startTime = Double(usableTimings[exact].start) + offset
+                endTime = Double(usableTimings[exact].end) + offset
+            } else if let previous, let next, previous.key != next.key {
+                let ratio = Double(refIndex - previous.key) / Double(next.key - previous.key)
+                let left = Double(usableTimings[previous.value].end) + offset
+                let right = Double(usableTimings[next.value].start) + offset
+                let slot = max(0.06, (right - left) / Double(next.key - previous.key))
+                startTime = left + ratio * (right - left) - slot * 0.5
+                endTime = startTime + slot
+            } else if let previous {
+                let step = 0.32
+                startTime = Double(usableTimings[previous.value].end) + offset + Double(refIndex - previous.key - 1) * step
+                endTime = startTime + step
+            } else if let next {
+                let step = 0.32
+                endTime = Double(usableTimings[next.value].start) + offset - Double(next.key - refIndex - 1) * step
+                startTime = max(offset, endTime - step)
+            } else { continue }
+            alignedWords[refIndex] = ReviewWord(text: referenceWords[refIndex], start: max(offset, startTime), end: max(startTime + 0.05, endTime))
         }
-        guard !selected.isEmpty else { return [] }
 
-        let totalWeights = selected.reduce(0) { $0 + max(1, normalizedWords($1).count) }
-        var consumedWeight = 0
         var output: [AlignedLyric] = []
-        for (index, line) in selected.enumerated() {
-            let weight = max(1, normalizedWords(line).count)
-            let startIndex = min(timings.count - 1, Int((Double(consumedWeight) / Double(totalWeights) * Double(timings.count)).rounded(.down)))
-            consumedWeight += weight
-            let nextIndex = min(timings.count, Int((Double(consumedWeight) / Double(totalWeights) * Double(timings.count)).rounded(.up)))
-            let endIndex = max(startIndex, min(timings.count - 1, nextIndex - 1))
-            let startTime = Double(timings[startIndex].start) + offset
-            var endTime = Double(timings[endIndex].end) + offset
-            if index + 1 < selected.count { endTime = max(endTime, startTime + 0.5) }
-            output.append(AlignedLyric(text: line, start: startTime, end: endTime))
+        var globalIndex = 0
+        for (lineIndex, words) in lineWords.enumerated() {
+            let indices = globalIndex..<(globalIndex + words.count)
+            let timed = indices.compactMap { alignedWords[$0] }
+            if !timed.isEmpty {
+                output.append(AlignedLyric(text: timed.map(\.text).joined(separator: " "), start: timed.first!.start, end: timed.last!.end, words: timed))
+            }
+            globalIndex += words.count
         }
         return output
     }
@@ -406,14 +454,7 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     private func makeGuidedReview(from lines: [AlignedLyric]) -> [ReviewWord] {
-        lines.flatMap { line -> [ReviewWord] in
-            let words = line.text.split(whereSeparator: { $0.isWhitespace }).map(String.init)
-            guard !words.isEmpty else { return [] }
-            let step = max(0.05, (line.end - line.start) / Double(words.count))
-            return words.enumerated().map { index, word in
-                ReviewWord(text: word, start: line.start + Double(index) * step, end: min(line.end, line.start + Double(index + 1) * step))
-            }
-        }
+        lines.flatMap(\.words)
     }
 
     private func unicodeToBamini(_ input: String) -> String {
