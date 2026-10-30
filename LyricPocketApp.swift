@@ -573,8 +573,10 @@ struct PlayerView: View {
                 }
             }
             .onChange(of: scenePhase) { _, phase in if phase != .active { song.stop() } }
-            .navigationDestination(isPresented: $song.showReview) {
-                TimingReviewView(song: song, accent: accent)
+            .fullScreenCover(isPresented: $song.showReview) {
+                NavigationStack {
+                    TimingReviewView(song: song, accent: accent)
+                }
             }
     }
 }
@@ -654,6 +656,7 @@ struct AdvancedSelectionView: View {
 struct TimingReviewView: View {
     @ObservedObject var song: SongPlayer
     let accent: Color
+    @Environment(\.dismiss) private var dismiss
 
     private var activeIndex: Int? {
         song.reviewWords.firstIndex { song.currentTime >= $0.start && song.currentTime < $0.end }
@@ -730,6 +733,11 @@ struct TimingReviewView: View {
         }
         .navigationTitle("Timing Review")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button("Done") { dismiss() }
+            }
+        }
         .background(Color(red: 0.07, green: 0.11, blue: 0.10))
         .onDisappear { song.stop() }
     }
