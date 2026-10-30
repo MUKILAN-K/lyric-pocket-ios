@@ -17,9 +17,13 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published var end: Double = 15
     @Published var playing = false
     @Published var language = "ta"
+    @Published var generationMode = "song"
+    @Published var suppliedLyrics = ""
+    @Published var embeddedLyrics = ""
     @Published var isGenerating = false
     @Published var transcript = ""
     @Published var srtURL: URL?
+    @Published var baminiSRTURL: URL?
     @Published var message = "Choose an audio file from Files."
     @Published var processingStage = ""
     private var player: AVAudioPlayer?
@@ -44,6 +48,9 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             start = 0
             end = min(15, duration)
             message = "Audio stays on this iPhone."
+            suppliedLyrics = ""
+            embeddedLyrics = ""
+            Task { await readEmbeddedLyrics(from: copy) }
         } catch {
             try? FileManager.default.removeItem(at: copy)
             message = "Could not open this file: \(error.localizedDescription)"
@@ -74,11 +81,20 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         isGenerating = true
         transcript = ""
         srtURL = nil
+        baminiSRTURL = nil
         processingStage = "Preparing audio"
         message = "Preparing the selected section…"
         let clipStart = start
         let clipEnd = end
         let chosenLanguage = language
+        let chosenMode = generationMode
+        let referenceLyrics = suppliedLyrics
+
+        if chosenMode == "guided" && lyricLines(from: referenceLyrics).isEmpty {
+            isGenerating = false
+            message = "Paste the correct lyrics or use lyrics found in the audio file first."
+            return
+        }
 
         Task {
             do {
@@ -128,8 +144,17 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
                         break
                     }
                 }
-                transcript = segments.map { cleanText($0.text) }.filter { !$0.isEmpty }.joined(separator: " ")
-                srtURL = try writeSRT(segments: segments, offset: clipStart)
+                if chosenMode == "guided" {
+                    processingStage = "Matching exact lyrics to detected word times"
+                    let words = segments.compactMap { $0.words }.flatMap { $0 }
+                    let aligned = try alignLyrics(referenceLyrics, to: words, offset: clipStart)
+                    transcript = aligned.map(\.text).joined(separator: "\n")
+                    srtURL = try writeAlignedSRT(aligned, bamini: false)
+                    baminiSRTURL = try writeAlignedSRT(aligned, bamini: true)
+                } else {
+                    transcript = segments.map { cleanText($0.text) }.filter { !$0.isEmpty }.joined(separator: " ")
+                    srtURL = try writeSRT(segments: segments, offset: clipStart)
+                }
                 message = transcript.isEmpty ? "No clear lyrics were detected. Try a section with louder vocals." : "Draft complete. Edit the words if needed, then export the SRT."
             } catch {
                 message = "Lyrics generation failed: \(error.localizedDescription)"
@@ -137,6 +162,23 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             isGenerating = false
             processingStage = ""
         }
+    }
+
+    private func readEmbeddedLyrics(from url: URL) async {
+        do {
+            let asset = AVURLAsset(url: url)
+            let metadata = try await asset.load(.commonMetadata)
+            for item in metadata {
+                let key = item.commonKey?.rawValue.lowercased() ?? ""
+                let identifier = item.identifier?.rawValue.lowercased() ?? ""
+                if key.contains("lyrics") || identifier.contains("lyrics"),
+                   let value = try await item.load(.stringValue), !value.isEmpty {
+                    embeddedLyrics = value
+                    message = "Lyrics were found inside this audio file."
+                    return
+                }
+            }
+        } catch { }
     }
 
     private func exportClip(from source: URL, start: Double, end: Double) async throws -> URL {
@@ -214,6 +256,123 @@ final class SongPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         return url
     }
 
+    private struct AlignedLyric {
+        let text: String
+        let start: Double
+        let end: Double
+    }
+
+    private func lyricLines(from text: String) -> [String] {
+        text.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && !($0.hasPrefix("[") && $0.hasSuffix("]")) }
+    }
+
+    private func normalizedWords(_ text: String) -> [String] {
+        text.lowercased().split(whereSeparator: { $0.isWhitespace }).compactMap { part in
+            let cleaned = String(part.unicodeScalars.filter { CharacterSet.letters.contains($0) || CharacterSet.decimalDigits.contains($0) })
+            return cleaned.isEmpty ? nil : cleaned
+        }
+    }
+
+    private func wordScore(_ left: String, _ right: String) -> Double {
+        guard !left.isEmpty, !right.isEmpty else { return 0 }
+        if left == right { return 1 }
+        if min(left.count, right.count) >= 3 && (left.contains(right) || right.contains(left)) { return 0.7 }
+        let a = Array(left), b = Array(right)
+        var row = Array(0...b.count)
+        for i in 1...a.count {
+            var next = [i] + Array(repeating: 0, count: b.count)
+            for j in 1...b.count {
+                next[j] = min(next[j - 1] + 1, row[j] + 1, row[j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1))
+            }
+            row = next
+        }
+        return max(0, 1 - Double(row[b.count]) / Double(max(a.count, b.count, 1)))
+    }
+
+    private func alignLyrics(_ lyrics: String, to timings: [WordTiming], offset: Double) throws -> [AlignedLyric] {
+        let lines = lyricLines(from: lyrics)
+        let recognized = timings.map { normalizedWords($0.word).joined() }
+        guard !lines.isEmpty, !timings.isEmpty, recognized.contains(where: { !$0.isEmpty }) else {
+            throw NSError(domain: "LyricPocket", code: 5, userInfo: [NSLocalizedDescriptionKey: "Word timing anchors were not detected. Try a longer section with clear vocals."])
+        }
+
+        var bestLine = 0
+        var bestScore = -1.0
+        for (index, line) in lines.enumerated() {
+            let candidates = normalizedWords(line)
+            guard !candidates.isEmpty else { continue }
+            let count = min(candidates.count, recognized.count)
+            let score = (0..<count).map { wordScore(candidates[$0], recognized[$0]) }.reduce(0, +) / Double(count)
+            if score > bestScore { bestScore = score; bestLine = index }
+        }
+
+        let available = Array(lines[bestLine...])
+        var selected: [String] = []
+        var lyricWordCount = 0
+        for line in available {
+            selected.append(line)
+            lyricWordCount += max(1, normalizedWords(line).count)
+            if lyricWordCount >= recognized.count { break }
+        }
+        guard !selected.isEmpty else { return [] }
+
+        let totalWeights = selected.reduce(0) { $0 + max(1, normalizedWords($1).count) }
+        var consumedWeight = 0
+        var output: [AlignedLyric] = []
+        for (index, line) in selected.enumerated() {
+            let weight = max(1, normalizedWords(line).count)
+            let startIndex = min(timings.count - 1, Int((Double(consumedWeight) / Double(totalWeights) * Double(timings.count)).rounded(.down)))
+            consumedWeight += weight
+            let nextIndex = min(timings.count, Int((Double(consumedWeight) / Double(totalWeights) * Double(timings.count)).rounded(.up)))
+            let endIndex = max(startIndex, min(timings.count - 1, nextIndex - 1))
+            let startTime = Double(timings[startIndex].start) + offset
+            var endTime = Double(timings[endIndex].end) + offset
+            if index + 1 < selected.count { endTime = max(endTime, startTime + 0.5) }
+            output.append(AlignedLyric(text: line, start: startTime, end: endTime))
+        }
+        return output
+    }
+
+    private func writeAlignedSRT(_ lyrics: [AlignedLyric], bamini: Bool) throws -> URL {
+        let body = lyrics.enumerated().map { index, lyric in
+            let text = bamini ? unicodeToBamini(lyric.text) : lyric.text
+            return "\(index + 1)\n\(srtTime(lyric.start)) --> \(srtTime(lyric.end))\n\(text)"
+        }.joined(separator: "\n\n")
+        let name = bamini ? "LyricPocket-Bamini.srt" : "LyricPocket-Unicode-Tamil.srt"
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        try body.write(to: url, atomically: true, encoding: .utf8)
+        return url
+    }
+
+    private func unicodeToBamini(_ input: String) -> String {
+        var text = input.replacingOccurrences(of: "ஸ்ரீ", with: "=").replacingOccurrences(of: ",", with: ">")
+        let bases: [(String, String, String, String)] = [
+            ("ஜ","[","[{","[_"),("க","f","F","$"),("ங","q","*","*"),("ச","r","R","R+"),
+            ("ஞ","Q","*","*"),("ட","l","L","^"),("ண","z","Z","Z}"),("த","j","J","J}"),
+            ("ந","e","E","E}"),("ன","d","D","D}"),("ப","g","G","G+"),("ம","k","K","%"),
+            ("ய","a","A","A+"),("ர","u","U","&"),("ல","y","Y","Y}"),("ள","s","S","Sh"),
+            ("வ","t","T","T+"),("ழ","o","O","*"),("ற","w","W","W}"),("ஹ","`","{`","`_"),
+            ("ஷ","\\","{","\\_"),("ஸ","]","]{","]_")
+        ]
+        for (letter, base, shortU, longU) in bases {
+            let replacements: [(String, String)] = [
+                (letter + "ௌ", "n" + base + "s"), (letter + "ோ", "N" + base + "h"),
+                (letter + "ொ", "n" + base + "h"), (letter + "ா", base + "h"),
+                (letter + "ி", letter == "ட" ? "b" : base + "p"),
+                (letter + "ீ", letter == "ட" ? "B" : base + "P"),
+                (letter + "ு", shortU), (letter + "ூ", longU),
+                (letter + "ெ", "n" + base), (letter + "ே", "N" + base),
+                (letter + "ை", "i" + base), (letter + "்", base + ";"), (letter, base)
+            ]
+            for (source, target) in replacements { text = text.replacingOccurrences(of: source, with: target) }
+        }
+        let vowels = [("அ","m"),("ஆ","M"),("இ",","),("ஈ","<"),("உ","c"),("ஊ","C"),("எ","v"),("ஏ","V"),("ஐ","I"),("ஒ","x"),("ஓ","X"),("ஔ","xs"),("ஃ","/")]
+        for (source, target) in vowels { text = text.replacingOccurrences(of: source, with: target) }
+        return text
+    }
+
     private func cleanText(_ text: String) -> String {
         text.replacingOccurrences(of: #"<\|[^>]+\|>"#, with: "", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -268,6 +427,25 @@ struct PlayerView: View {
                             Text("English").tag("en")
                             Text("Tamil + English").tag("auto")
                         }.pickerStyle(.segmented)
+                        Picker("Generation mode", selection: $song.generationMode) {
+                            Text("Song only").tag("song")
+                            Text("Song + Lyrics").tag("guided")
+                        }.pickerStyle(.segmented)
+                        if song.generationMode == "guided" {
+                            VStack(alignment: .leading, spacing: 10) {
+                                Text("Correct lyrics").font(.headline)
+                                if !song.embeddedLyrics.isEmpty {
+                                    Button("Use lyrics found in this audio file", systemImage: "text.badge.checkmark") {
+                                        song.suppliedLyrics = song.embeddedLyrics
+                                    }.buttonStyle(.bordered)
+                                }
+                                TextEditor(text: $song.suppliedLyrics)
+                                    .frame(minHeight: 180).padding(8)
+                                    .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+                                Text("Paste the full lyrics or the lines for your selected section. Section labels such as [Chorus] are ignored.")
+                                    .font(.footnote).foregroundStyle(.secondary)
+                            }
+                        }
                         if song.language == "ta" {
                             VStack(alignment: .leading, spacing: 6) {
                                 Label("Vocal Focus active", systemImage: "waveform.badge.magnifyingglass")
@@ -300,8 +478,15 @@ struct PlayerView: View {
                         }
                         if let srtURL = song.srtURL {
                             ShareLink(item: srtURL) {
-                                Label("Export SRT", systemImage: "square.and.arrow.up")
+                                Label(song.generationMode == "guided" ? "Export Unicode Tamil SRT" : "Export SRT", systemImage: "square.and.arrow.up")
                             }.buttonStyle(.bordered)
+                        }
+                        if let baminiSRTURL = song.baminiSRTURL {
+                            ShareLink(item: baminiSRTURL) {
+                                Label("Export Bamini SRT", systemImage: "square.and.arrow.up")
+                            }.buttonStyle(.bordered)
+                            Text("The Bamini export requires the Bamini font in your video editor. Keep the Unicode SRT as your master copy.")
+                                .font(.footnote).foregroundStyle(.secondary)
                         }
                     }
                     Text(song.message).font(.footnote).accessibilityIdentifier("status")
